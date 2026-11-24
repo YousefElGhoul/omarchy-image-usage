@@ -1,0 +1,696 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Codex image generation limit as JSON
+# omarchy:args=[--force] [--print-only]
+"""Collect the ChatGPT subscription's image generation limit, the one Codex's
+built-in image_gen tool runs into, into one display-ready JSON record, the way
+Omarchy's agent usage collectors do.
+
+The limit is not in the Codex app-server's account/rateLimits/read, nor in
+/backend-api/wham/usage. ChatGPT's web-app image counter (conversation/init's
+`image_gen` entry) is a different allowance from the one that turns Codex
+away. The image endpoint reports its own limit, in the same x-codex-* headers
+the Responses API uses for the Codex windows:
+
+  x-codex-active-limit: imagegen_premium
+  x-codex-primary-used-percent: 100
+  x-codex-primary-window-minutes: 1440
+  x-codex-primary-reset-at: <epoch seconds>
+
+So the probe is POST {chatgpt_base_url}/codex/images/edits with an empty JSON
+object. An edit with neither a prompt nor an image can't produce anything, but
+the request passes through the limit check, which answers with those headers.
+A body that isn't JSON is turned away before that check, and so is useless.
+
+Nothing here signs in. The request is made with the ChatGPT login Codex
+already holds for the active account. A file-store login that is still
+valid is read straight from auth.json. A login kept in the keyring, an
+expiring token, or a rejected one goes through `codex app-server` and its
+getAuthStatus call. Codex refreshes the token there and stores it itself.
+This script never writes credentials.
+
+The record is written atomically to
+$XDG_STATE_HOME/omarchy/image-usage/usage.json, where the panel watches it.
+"""
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import math
+import os
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+RECORD_ID = "codex-images"
+RECORD_NAME = "Image generation"
+DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
+PROBE_PATH = "/codex/images/edits"
+USER_AGENT = "omarchy-image-usage/1.0"
+
+AUTH_HELP = "Run `codex login` to authenticate."
+API_KEY_HELP = "Codex is signed in with an API key, which has no ChatGPT image limit."
+
+# A record this recent is the answer to a refresh that was not forced, so a
+# panel on every monitor, opened and closed in a row, asks the server once.
+REUSE_SEC = 60
+# A token closer than this to expiring goes through Codex to be refreshed.
+TOKEN_MARGIN_SEC = 300
+
+# Codex's /status names for the wire plan types, as the Omarchy Codex
+# collector shows them. A plan newer than this table keeps its wire name.
+PLAN_NAMES = {
+    "free": "Free",
+    "go": "Go",
+    "plus": "Plus",
+    "pro": "Pro 200",
+    "prolite": "Pro 100",
+    "promax": "Pro 500",
+    "team": "Business",
+    "business": "Enterprise",
+    "enterprise": "Enterprise",
+    "edu": "Edu",
+}
+
+TRANSPORT_HINTS = (
+    "timed out",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "no route to host",
+)
+class Failure(Exception):
+  """A probe that produced no limit. `status` is the short line shown beside
+  the numbers, `help` says what to do, and `transport` marks a network that
+  isn't up yet, which is worth asking again soon."""
+
+  def __init__(self, status, help_text="", transport=False, auth=False):
+    super().__init__(status)
+    self.status = status
+    self.help = help_text
+    self.transport = transport
+    self.auth = auth
+
+
+# ---------------------------------------------------------------- paths
+
+def state_dir():
+  base = os.environ.get("XDG_STATE_HOME") or os.path.join(str(Path.home()), ".local", "state")
+  return Path(base) / "omarchy" / "image-usage"
+
+
+def now_ms():
+  return int(time.time() * 1000)
+
+
+def read_json(path):
+  try:
+    with open(path, encoding="utf-8") as handle:
+      value = json.load(handle)
+    return value if isinstance(value, dict) else {}
+  except Exception:
+    return {}
+
+
+def write_json(path, value):
+  path.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+  try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+      json.dump(value, handle, indent=2)
+      handle.write("\n")
+    os.replace(tmp, path)
+  except Exception:
+    try:
+      os.unlink(tmp)
+    except OSError:
+      pass
+    raise
+
+
+def finite(value):
+  if isinstance(value, bool) or value is None:
+    return None
+  try:
+    number = float(value)
+  except (TypeError, ValueError):
+    return None
+  return number if math.isfinite(number) else None
+
+
+def to_epoch(value):
+  """An ISO time, or seconds or milliseconds since the epoch, as seconds."""
+  number = finite(value)
+  if number is not None:
+    return number / 1000 if number > 1e12 else number
+  if not isinstance(value, str) or not value.strip():
+    return None
+  try:
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+  except ValueError:
+    return None
+  if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=timezone.utc)
+  return parsed.timestamp()
+
+
+def iso(epoch):
+  try:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds") if epoch else ""
+  except (OverflowError, OSError, ValueError):
+    return ""
+
+
+def jwt_claims(token):
+  try:
+    payload = str(token).split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(payload))
+    return claims if isinstance(claims, dict) else {}
+  except Exception:
+    return {}
+
+
+def plan_name(plan):
+  plan = str(plan or "")
+  return PLAN_NAMES.get(plan, plan.replace("_", " ").title())
+
+
+# ---------------------------------------------------------------- codex
+
+def codex_home():
+  """The Codex home of the account new sessions use: Omarchy's account
+  registry when it has one, else CODEX_HOME, else ~/.codex."""
+  tool = shutil.which("omarchy-agent-account-home")
+  if tool:
+    try:
+      out = subprocess.run([tool, "codex"], capture_output=True, text=True, timeout=5)
+      home = out.stdout.strip()
+      if out.returncode == 0 and home:
+        return Path(home).expanduser()
+    except Exception:
+      pass
+  return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+
+
+def codex_config(home):
+  try:
+    with (home / "config.toml").open("rb") as handle:
+      config = tomllib.load(handle)
+    return config if isinstance(config, dict) else {}
+  except Exception:
+    return {}
+
+
+def find_codex():
+  """A codex that is already installed. mise's shims (and launchers that run
+  `mise use`) install the tool on first run, so they are passed over, and
+  `mise which` resolves an installed one offline instead."""
+  data = os.environ.get("MISE_DATA_DIR") or os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.join(str(Path.home()), ".local", "share"), "mise")
+  shims = os.path.realpath(os.path.join(data, "shims"))
+  for directory in os.environ.get("PATH", "").split(os.pathsep):
+    candidate = os.path.join(directory, "codex")
+    if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+      continue
+    if os.path.realpath(os.path.dirname(os.path.abspath(candidate))) == shims:
+      continue
+    try:
+      with open(candidate, "rb") as handle:
+        head = handle.read(4096)
+      if b"mise use" in head or b"mise x " in head:
+        continue
+    except OSError:
+      continue
+    return candidate
+  mise = shutil.which("mise")
+  if mise:
+    try:
+      out = subprocess.run([mise, "which", "codex"], capture_output=True, text=True,
+                           env=dict(os.environ, MISE_OFFLINE="1"), timeout=10)
+      resolved = out.stdout.strip()
+      if out.returncode == 0 and os.path.isfile(resolved):
+        return resolved
+    except Exception:
+      pass
+  return None
+
+
+class Credentials:
+  def __init__(self, token, account_id, plan="", user_id="", base_url=DEFAULT_BASE_URL, source="file"):
+    self.token = token
+    self.account_id = account_id or ""
+    self.plan = plan or ""
+    self.user_id = user_id or ""
+    self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
+    self.source = source
+
+  @property
+  def identity(self):
+    # Hashed, so the record names the account without carrying its ids.
+    if not (self.account_id or self.user_id):
+      return ""
+    raw = f"{self.account_id}\n{self.user_id}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def configured_base_url(config):
+  value = str(config.get("chatgpt_base_url") or "").strip().rstrip("/")
+  if not value:
+    return ""
+  return value if value.endswith("/backend-api") else value + "/backend-api"
+
+
+def file_credentials(home, config):
+  """The login in auth.json while its access token has time left. None when
+  only Codex can produce a token: another credential store, a token from the
+  environment, or a token that is about to expire."""
+  if os.environ.get("CODEX_ACCESS_TOKEN"):
+    return None
+  if str(config.get("cli_auth_credentials_store") or "file") != "file":
+    return None
+  auth_path = home / "auth.json"
+  if not auth_path.is_file():
+    raise Failure("Waiting for auth", AUTH_HELP, auth=True)
+  auth = read_json(auth_path)
+  mode = auth.get("auth_mode")
+  tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+  if mode == "apikey" or (mode is None and auth.get("OPENAI_API_KEY") and not tokens):
+    raise Failure("No ChatGPT login", API_KEY_HELP)
+  token = str(tokens.get("access_token") or "")
+  if not token:
+    raise Failure("Waiting for auth", AUTH_HELP, auth=True)
+  claims = jwt_claims(token)
+  exp = finite(claims.get("exp")) or 0
+  if exp and exp - time.time() < TOKEN_MARGIN_SEC:
+    return None
+  openai = claims.get("https://api.openai.com/auth") if isinstance(claims.get("https://api.openai.com/auth"), dict) else {}
+  return Credentials(
+    token,
+    tokens.get("account_id") or openai.get("chatgpt_account_id"),
+    plan=openai.get("chatgpt_plan_type"),
+    user_id=openai.get("chatgpt_user_id") or openai.get("user_id"),
+    base_url=configured_base_url(config) or DEFAULT_BASE_URL,
+    source="file",
+  )
+
+
+class AppServer:
+  """One short-lived `codex app-server`, spoken to over JSON-RPC on stdio."""
+
+  def __init__(self, codex, home):
+    self.stderr = tempfile.TemporaryFile("w+", errors="replace")
+    self.proc = subprocess.Popen(
+      [codex, "-s", "read-only", "-a", "on-request", "app-server"],
+      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
+      env=dict(os.environ, CODEX_HOME=str(home)),
+    )
+    self.pending = b""
+    self.next_id = 1
+
+  def send(self, payload):
+    try:
+      self.proc.stdin.write((json.dumps(payload) + "\n").encode())
+      self.proc.stdin.flush()
+    except OSError as exc:
+      raise RuntimeError("Codex app-server exited") from exc
+
+  def request(self, method, params=None, timeout=10):
+    request_id = self.next_id
+    self.next_id += 1
+    self.send({"id": request_id, "method": method, "params": params or {}})
+    fd = self.proc.stdout.fileno()
+    deadline = time.monotonic() + timeout
+    while True:
+      while b"\n" in self.pending:
+        line, self.pending = self.pending.split(b"\n", 1)
+        try:
+          message = json.loads(line)
+        except Exception:
+          continue
+        if isinstance(message, dict) and message.get("id") == request_id:
+          return message
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        raise TimeoutError(f"Codex app-server did not answer {method}")
+      ready, _, _ = select.select([fd], [], [], min(0.25, remaining))
+      if not ready:
+        if self.proc.poll() is not None:
+          raise RuntimeError(f"Codex app-server exited before {method}")
+        continue
+      chunk = os.read(fd, 65536)
+      if not chunk:
+        raise RuntimeError(f"Codex app-server exited before {method}")
+      self.pending += chunk
+
+  def stderr_tail(self):
+    try:
+      self.proc.wait(timeout=1)
+      self.stderr.seek(0)
+      lines = [line.strip() for line in self.stderr.read().splitlines() if line.strip()]
+      return " ".join(lines)[-275:]
+    except Exception:
+      return ""
+
+  def close(self):
+    try:
+      self.proc.terminate()
+      self.proc.wait(timeout=1)
+    except Exception:
+      try:
+        self.proc.kill()
+      except Exception:
+        pass
+    self.stderr.close()
+
+
+def codex_credentials(home, config, refresh):
+  """A token from Codex itself, refreshed by it when asked to."""
+  codex = find_codex()
+  if not codex:
+    raise Failure("Image limit unavailable", "codex not found in PATH")
+  try:
+    server = AppServer(codex, home)
+  except Exception as exc:
+    raise Failure("Image limit unavailable", str(exc)[:300])
+  try:
+    server.request("initialize", {"clientInfo": {"name": "omarchy-image-usage", "version": "1"}})
+    server.send({"method": "initialized", "params": {}})
+    status = server.request("getAuthStatus", {"includeToken": True, "refreshToken": bool(refresh)}, timeout=20)
+    result = status.get("result") if isinstance(status.get("result"), dict) else {}
+    method = str(result.get("authMethod") or "")
+    if method in ("apikey", "apiKey"):
+      raise Failure("No ChatGPT login", API_KEY_HELP)
+    token = str(result.get("authToken") or "")
+    if not token:
+      raise Failure("Waiting for auth", AUTH_HELP, auth=True)
+
+    account, user_id, plan, base = {}, "", "", ""
+    try:
+      read = server.request("account/read", {}, timeout=5)
+      read_result = read.get("result") if isinstance(read.get("result"), dict) else {}
+      account = read_result.get("account") if isinstance(read_result.get("account"), dict) else {}
+      user_id = str(read_result.get("userId") or "")
+      routing = read_result.get("workspaceRouting") if isinstance(read_result.get("workspaceRouting"), dict) else {}
+      origin = str(routing.get("backendOrigin") or "").rstrip("/")
+      base = origin + "/backend-api" if origin else ""
+      account["id"] = routing.get("chatgptAccountId")
+    except (TimeoutError, RuntimeError):
+      pass
+    claims = jwt_claims(token).get("https://api.openai.com/auth")
+    claims = claims if isinstance(claims, dict) else {}
+    return Credentials(
+      token,
+      account.get("id") or claims.get("chatgpt_account_id"),
+      plan=account.get("planType") or claims.get("chatgpt_plan_type"),
+      user_id=user_id or claims.get("chatgpt_user_id") or claims.get("user_id"),
+      base_url=configured_base_url(config) or base or DEFAULT_BASE_URL,
+      source="codex",
+    )
+  except Failure:
+    raise
+  except Exception as exc:
+    detail = server.stderr_tail() if server.proc.poll() is not None else ""
+    text = (f"codex app-server exited: {detail}" if detail else str(exc))[:300]
+    raise Failure("Image limit unavailable", text,
+                  transport=isinstance(exc, TimeoutError) or any(h in text.lower() for h in TRANSPORT_HINTS))
+  finally:
+    server.close()
+
+
+# ---------------------------------------------------------------- limit
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def probe(creds):
+    """The image endpoint's answer to an edit it can't carry out: its status,
+    headers, and JSON body, if any."""
+    if creds.base_url != DEFAULT_BASE_URL:
+        raise Failure("Image limit unavailable", "The image limit check only supports the official ChatGPT endpoint.")
+
+    headers = {
+        "Authorization": "Bearer " + creds.token,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    if creds.account_id:
+        headers["ChatGPT-Account-Id"] = creds.account_id
+    request = urllib.request.Request(
+        creds.base_url + PROBE_PATH, data=b"{}", method="POST", headers=headers
+    )
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=20) as response:
+            status, response_headers, raw = (
+                response.status,
+                response.headers,
+                response.read(),
+            )
+    except urllib.error.HTTPError as exc:
+        status, response_headers = exc.code, exc.headers
+        try:
+            raw = exc.read()
+        except Exception:
+            raw = b""
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise Failure(
+            "Image limit unavailable",
+            f"Couldn't reach ChatGPT ({reason}).",
+            transport=True,
+        )
+    try:
+        body = json.loads(raw or b"{}")
+    except ValueError:
+        body = {}
+    return (
+        status,
+        {k.lower(): v for k, v in (response_headers or {}).items()},
+        body if isinstance(body, dict) else {},
+    )
+
+
+def window_title(minutes):
+    if minutes >= 28 * 24 * 60:
+        return "Monthly"
+    if minutes >= 7 * 24 * 60:
+        return "Weekly"
+    if minutes == 24 * 60:
+        return "Daily"
+    if minutes and minutes % 60 == 0:
+        return f"{minutes // 60}h window"
+    if minutes:
+        return f"{minutes}m window"
+    return "Limit"
+
+
+def header_window(headers, which, now):
+    used = finite(headers.get(f"x-codex-{which}-used-percent"))
+    if used is None:
+        return None
+    minutes = int(finite(headers.get(f"x-codex-{which}-window-minutes")) or 0)
+    reset = to_epoch(headers.get(f"x-codex-{which}-reset-at"))
+    if not reset:
+        after = finite(headers.get(f"x-codex-{which}-reset-after-seconds"))
+        reset = now + after if after and after > 0 else None
+    # The headers carry an empty secondary window: no span, nothing used, no
+    # reset. That is no window at all.
+    if not minutes and not reset and used == 0:
+        return None
+    return {
+        "title": window_title(minutes),
+        "percent": max(0.0, min(1.0, used / 100.0)),
+        "resetsAt": iso(reset) if reset and reset > now else "",
+        "minutes": minutes,
+    }
+
+
+def read_limit(status, headers, body, now):
+    if status == 401:
+        raise Failure("Sign-in expired", AUTH_HELP, auth=True)
+    error = body.get("error") if isinstance(body.get("error"), dict) else {}
+    reached = status == 429 and error.get("type") == "usage_limit_reached"
+
+    limits = [
+        w
+        for w in (
+            header_window(headers, "primary", now),
+            header_window(headers, "secondary", now),
+        )
+        if w
+    ]
+    if reached and not limits:
+        # The headers didn't come through, but the error itself says when.
+        reset = to_epoch(error.get("resets_at"))
+        if not reset and finite(error.get("resets_in_seconds")):
+            reset = now + finite(error.get("resets_in_seconds"))
+        minutes = int(finite(error.get("limit_window_minutes")) or 0)
+        limits = [
+            {
+                "title": window_title(minutes),
+                "percent": 1.0,
+                "resetsAt": iso(reset),
+                "minutes": minutes,
+            }
+        ]
+
+    if not limits:
+        if status == 429:
+            raise Failure(
+                "Image limit unavailable",
+                "ChatGPT is throttling requests (HTTP 429).",
+                transport=True,
+            )
+        if status == 403:
+            raise Failure(
+                "Image limit unavailable", "ChatGPT refused the request (HTTP 403)."
+            )
+        if status >= 500:
+            raise Failure(
+                "Image limit unavailable",
+                f"ChatGPT answered HTTP {status}.",
+                transport=True,
+            )
+        raise Failure(
+            "Image limit unavailable",
+            f"ChatGPT answered HTTP {status} without its image limit.",
+        )
+
+    return {
+        "plan": headers.get("x-codex-plan-type") or error.get("plan_type") or "",
+        "limitId": headers.get("x-codex-active-limit") or "",
+        "limits": limits,
+        "limitReached": reached or any(w["percent"] >= 1 for w in limits),
+    }
+
+
+# ---------------------------------------------------------------- main
+
+
+def collect(home):
+    config = codex_config(home)
+    creds = file_credentials(home, config)
+    if creds is None:
+        creds = codex_credentials(home, config, refresh=True)
+    try:
+        limit = read_limit(*probe(creds), time.time())
+    except Failure as failure:
+        # A token read from disk can have been revoked or rotated by another
+        # login: Codex gets one chance to hand over a fresh one.
+        if not failure.auth or creds.source != "file":
+            raise
+        creds = codex_credentials(home, config, refresh=True)
+        limit = read_limit(*probe(creds), time.time())
+    limit["plan"] = plan_name(limit["plan"] or creds.plan)
+    return creds, limit
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="ask ChatGPT even if the last answer is recent",
+    )
+    parser.add_argument(
+        "--print-only", action="store_true", help="print the record without writing it"
+    )
+    args = parser.parse_args()
+
+    directory = state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    record_path = directory / "usage.json"
+
+    # One probe at a time: a bar on each monitor runs its own timer.
+    with open(directory / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        home = codex_home()
+        previous = read_json(record_path)
+        if previous.get("id") != RECORD_ID:
+            previous = {}
+        same_home = previous.get("home") == str(home)
+        fetched_at = finite(previous.get("limitsFetchedAt")) or 0
+        if (
+            not args.force
+            and same_home
+            and previous.get("limitsStale") is False
+            and now_ms() - fetched_at < REUSE_SEC * 1000
+        ):
+            print(json.dumps(previous))
+            return 0
+
+        record = {
+            "schemaVersion": 2,
+            "id": RECORD_ID,
+            "name": RECORD_NAME,
+            "home": str(home),
+            "account": "",
+            "plan": "",
+            "limitId": "",
+            "limits": [],
+            "limitReached": False,
+            "usageStatusText": "",
+            "authHelpText": "",
+            "limitsStale": False,
+            "limitsFetchedAt": 0,
+            "updatedAt": now_ms(),
+        }
+        try:
+            creds, limit = collect(home)
+            record.update(limit)
+            record["account"] = creds.identity
+            record["limitsFetchedAt"] = record["updatedAt"]
+        except Failure as failure:
+            record.update(
+                usageStatusText=failure.status,
+                authHelpText=failure.help,
+                limitsStale=True,
+            )
+            if failure.transport:
+                record["retryAdvised"] = True
+            # The last good numbers stand, with their age, for the same account:
+            # one dropped request is no reason to blank them.
+            if (
+                same_home
+                and finite(previous.get("limitsFetchedAt"))
+                and not failure.auth
+            ):
+                for key in (
+                    "account",
+                    "plan",
+                    "limitId",
+                    "limits",
+                    "limitReached",
+                    "limitsFetchedAt",
+                ):
+                    if key in previous:
+                        record[key] = previous[key]
+                if failure.status == "Image limit unavailable":
+                    record["usageStatusText"] = ""
+
+        if not args.print_only:
+            write_json(record_path, record)
+        print(json.dumps(record))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

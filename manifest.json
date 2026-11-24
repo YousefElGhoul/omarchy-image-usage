@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.yousefelghoul.image-usage",
+  "name": "Image Usage",
+  "version": "1.0.0",
+  "author": "YousefElGhoul",
+  "license": "MIT",
+  "description": "Your ChatGPT subscription's image generation limit, the one Codex's image_gen tool runs into, in a native Omarchy bar panel: how much is used and when it resets.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Image Usage",
+    "description": "One bar icon and one panel: the image generation limit's share used and the time until it resets.",
+    "category": "AI",
+    "aliases": [
+      "images",
+      "image-usage",
+      "imagegen"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "warnPercent": 90
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 60,
+        "max": 3600,
+        "step": 60,
+        "defaultValue": 300
+      },
+      {
+        "key": "warnPercent",
+        "type": "integer",
+        "label": "Warn at (% used)",
+        "description": "Light the icon and meter in the urgent color once this share of the limit is used.",
+        "min": 50,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 90
+      }
+    ]
+  }
+}
